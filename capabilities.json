@@ -42,7 +42,8 @@
             { "for": { "in": "county" } },
             { "for": { "in": "troop" } }
           ],
-          "dataReductionAlgorithm": { "top": { "count": 10000 } }
+          "dataReductionAlgorithm": { "top": { "count": 10000 } },
+          "suppressEmptyGroups": true
         },
         "values": {
           "select": [

@@ -71,6 +71,25 @@ export class Visual implements IVisual {
 
   private autoRefreshTimer: number | null = null;
 
+  // To catch and apply initial filters
+  private hasAppliedInitialWhere = false;
+
+  private lastSnapshot?: {
+    desiredMode: "LEL" | "COUNTY";
+    where: string;
+    lelKey: string;
+    countyKey: string;
+    troopKey: string;
+  };
+
+  // class field (top of class)
+  private io?: IntersectionObserver;
+
+  // Baselines for "all values" detection (null = not captured yet)
+  private baselineCountyCount: number | null = null;
+  private baselineTroopCount: number | null = null;
+  private baselineLelCount:   number | null = null;
+
   constructor(options: VisualConstructorOptions | undefined) {
     this.target = options?.element!;
     this.host = options?.host!;
@@ -161,9 +180,10 @@ export class Visual implements IVisual {
       }
     } as any) as EsriFeatureLayer;
 
-    // -------- HCCS layer (default LEL mode statewide) --------
+    // -------- HCCS layer (start empty; first update will apply real filters) --------
     this.currentMode = "LEL";
-    this.lastWhere = "LELRank IN (1,2,3,4,5)";
+    // Use a sentinel so the first update always triggers setWhere(...)
+    this.lastWhere = "__UNSET__";
 
     this.hccsStyle = (feature: GeoJSON.Feature) => {
       const p = feature.properties as any;
@@ -174,10 +194,12 @@ export class Visual implements IVisual {
 
     this.hccsLayer = LEsri.featureLayer({
       url: "https://ags.coverlab.org/server/rest/services/HighCrashCorridors/HCCs/FeatureServer/0",
-      where: this.lastWhere, pane: "hccs",
+      where: "1=0",
+      pane: "hccs",
       idField: "OBJECTID",
-      fields: ["OBJECTID", "RouteName", "LEL_Region", "Troop", "County", "LELRank", "CntyRankVeh", "CrashDateStart", "CrashDateEnd"],
-      simplifyFactor: 0.5, precision: 5,
+      fields: ["OBJECTID","RouteName","LEL_Region","Troop","County","LELRank","CntyRankVeh","CrashDateStart","CrashDateEnd"],
+      simplifyFactor: 0.5,
+      precision: 5,
       style: this.hccsStyle,
       onEachFeature: (feature: GeoJSON.Feature, layer: L.Layer) => {
         const path = layer as L.Path;
@@ -201,16 +223,29 @@ export class Visual implements IVisual {
           const { weight } = this.getRankStyle(Number(r));
           path.setStyle({ weight });
         });
-      }
+      }      
     } as any) as EsriFeatureLayer;
 
     this.hccsLayer.addTo(this.map);
 
     // call these in your constructor after layers are created:
     this.startAutoRefresh(6 * 60 * 60 * 1000);  // every 6 hours (tune as you like)
-    document.addEventListener("visibilitychange", this.onVisibilityRefresh);
+    document.addEventListener("visibilitychange", this.onVisibilityRefresh);  
+    
+    // constructor — RIGHT HERE, after hccsLayer is added + listeners wired
+    this.io = new IntersectionObserver((entries) => {
+      if (entries.some(e => e.isIntersecting)) {
+        if (this.lastSnapshot && this.hccsLayer) {
+          // Bust cache then re-apply current WHERE/style
+          (this.hccsLayer as any).setWhere("1=0");
+          (this.hccsLayer as any).refresh?.();
+          setTimeout(() => this.applyState(this.lastSnapshot!, true), 0);
+        }
+      }
+    }, { root: null, threshold: 0.01 });
 
-    // Retry on 400 (e.g., LEL_Region type mismatch)
+    this.io.observe(this.mapContainer);    
+
     this.hccsLayer.on("requesterror", (e: any) => {
       console.warn("[HCCS requesterror]", e, "WHERE:", e?.params?.where);
       if (e?.params?.where === this.lastWhere && this.lastLelAltWhere && this.hccsLayer) {
@@ -221,13 +256,6 @@ export class Visual implements IVisual {
         (this.hccsLayer as any).refresh?.();
         console.warn("[HCCS] Retrying with alternate WHERE:", alt);
       }
-    });
-
-    // Initial fit
-    this.hccsLayer.once("load", () => {
-      this.hccsLayer!.query().where(this.lastWhere).bounds((err, b) => {
-        if (!err && b && b.isValid()) this.map.fitBounds(b.pad(0.05));
-      });
     });
 
     // -------- Layer control --------
@@ -295,12 +323,19 @@ export class Visual implements IVisual {
 
   public update(options: VisualUpdateOptions): void {
     const dv = options.dataViews?.[0];
+
+    console.log("Map edited!");
     console.log("[update] fired", {
       hasDV: !!dv,
       categories: dv?.categorical?.categories?.length ?? 0,
       values: dv?.categorical?.values?.length ?? 0,
       hasTable: !!dv?.table,
       rows: dv?.table?.rows?.length ?? 0
+    });
+    console.log("[dv snapshot]", {
+      catNames: dv?.categorical?.categories?.map(c => c.source.roles),
+      catCounts: dv?.categorical?.categories?.map(c => c.values?.length ?? 0),
+      vals: dv?.categorical?.values?.map(v => v.source.displayName)
     });
 
     this.resizeMap(options);
@@ -309,7 +344,34 @@ export class Visual implements IVisual {
       clearTimeout(this.pendingFitTimer);
       this.pendingFitTimer = null;
     }
-    if (!dv) return;
+
+    if (!dv) {
+      this.hasAppliedInitialWhere = false; // you already have this
+      this.baselineCountyCount = this.baselineTroopCount = this.baselineLelCount = null;
+      return;
+    }
+
+    // --- capture current category cardinalities by role
+    const cats = dv?.categorical?.categories ?? [];
+    const countByRole = (role: string) => (cats.find(c => c.source.roles?.[role])?.values?.length ?? 0);
+
+    const currCountyCount = countByRole("county");
+    const currTroopCount  = countByRole("troop");
+    const currLelCount    = countByRole("lelRegion");
+
+    // Only capture baselines when they look like "many" values.
+    // (Use > 1; or pick a higher threshold like >= 10 for extra safety.)
+    const looksLikeAll = (n: number) => n > 1;
+
+    if (!this.hasAppliedInitialWhere || this.baselineCountyCount === null) {
+      if (looksLikeAll(currCountyCount)) this.baselineCountyCount = currCountyCount;
+      if (looksLikeAll(currTroopCount))  this.baselineTroopCount  = currTroopCount;
+      if (looksLikeAll(currLelCount))    this.baselineLelCount    = currLelCount;
+
+      console.log("[baselines set]", {
+        county: this.baselineCountyCount, troop: this.baselineTroopCount, lel: this.baselineLelCount
+      });
+    } 
 
     // helpers
     const norm = (s: string) => String(s ?? "")
@@ -340,6 +402,14 @@ export class Visual implements IVisual {
       troopsRaw.map(t => String(t).trim().toUpperCase().replace(/^TROOP\s+/, ""))
     );
 
+    // If cardinality equals baseline, treat as unfiltered (i.e., empty selection for logic)
+    const countyUnfiltered = (this.baselineCountyCount !== null) && (this.baselineCountyCount > 1) && (currCountyCount === this.baselineCountyCount);
+    const troopUnfiltered  = (this.baselineTroopCount  !== null) && (this.baselineTroopCount  > 1) && (currTroopCount  === this.baselineTroopCount);
+
+    // Important: clear sets so downstream logic sees “no county/troop selection”
+    if (countyUnfiltered) selectedCountyBases.clear();
+    if (troopUnfiltered)  selectedTroops.clear();  
+
     // keys used to detect *changes* across updates
     const lelKey = Array.from(selectedLelRegions).sort().join("|");
     const countyKey = Array.from(selectedCountyBases).sort().join("|");
@@ -358,66 +428,104 @@ export class Visual implements IVisual {
     const singleCountyFallback =
       (selectedCountyBases.size === 1) && (selectedLelRegions.size === 0 || lelRegionsRaw.length === 0);
 
-    // mode selection priority:
-    // 1) explicit flags  2) change-based inference  3) single-county fallback  4) hold current mode
+    // MODE: prefer COUNTY whenever user picked any County or Troop (unless LEL flag forces LEL)
+    const hasCounty = selectedCountyBases.size > 0;
+    const hasTroop  = selectedTroops.size > 0;
+    const hasLel    = selectedLelRegions.size > 0;
+
     let desiredMode: "LEL" | "COUNTY";
     if (countyModeFlag) desiredMode = "COUNTY";
     else if (lelModeFlag) desiredMode = "LEL";
-    else if (countyChanged && !lelChanged) desiredMode = "COUNTY";
-    else if (lelChanged && !countyChanged) desiredMode = "LEL";
-    else if (troopChanged && !lelChanged) desiredMode = "COUNTY";
-    else if (singleCountyFallback) desiredMode = "COUNTY";
-    else if (selectedTroops.size > 0 && !lelChanged && !countyChanged) desiredMode = "COUNTY";
-    else desiredMode = this.currentMode;
-
-    // WHERE
-    // replace your WHERE block in update(...) with this:
+    else if (hasCounty || hasTroop) desiredMode = "COUNTY"; // hard preference
+    else desiredMode = "LEL";
 
     let computedWhere: string;
 
     if (desiredMode === "COUNTY") {
       this.lastLelAltWhere = null;
 
-      const allowCountyTokens = true;
-      const allowTroopTokens = selectedTroops.size > 0;
-
-      const bases = allowCountyTokens ? Array.from(selectedCountyBases) : [];
-      const countyList = bases.length
-        ? bases.map(b => [`'${esc(b)}'`, `'${esc(b + " COUNTY")}'`]).flat().join(",")
-        : "";
+      // COUNTY & TROOP tokenization (normalize to UPPER and include COUNTY/CO variants)
+      const bases = Array.from(selectedCountyBases);
+      const countyTokens = bases.flatMap(b => {
+        const up = esc(b.toUpperCase());
+        return [`'${up}'`, `'${up} COUNTY'`, `'${up} CO'`];
+      });
+      const countyVals = Array.from(new Set(countyTokens)).join(",");
 
       const troopTokens: string[] = [];
-      if (allowTroopTokens) {
-        for (const t of selectedTroops) {
-          const tt = t.replace(/'/g, "''");
-          troopTokens.push(`'${tt}'`, `'TROOP ${tt}'`);
-        }
+      for (const t of selectedTroops) {
+        const up = esc(t.toUpperCase());
+        troopTokens.push(`'${up}'`, `'TROOP ${up}'`);
       }
-      const troopList = troopTokens.length ? Array.from(new Set(troopTokens)).join(",") : "";
+      const troopVals = Array.from(new Set(troopTokens)).join(",");
 
-      if (countyList && troopList) {
-        computedWhere = `(UPPER(County) IN (${countyList}) AND UPPER(Troop) IN (${troopList}) AND CntyRankVeh IN (1,2,3,4,5))`;
-      } else if (countyList) {
-        computedWhere = `(UPPER(County) IN (${countyList}) AND CntyRankVeh IN (1,2,3,4,5))`;
-      } else if (troopList) {
-        computedWhere = `(UPPER(Troop) IN (${troopList}) AND CntyRankVeh IN (1,2,3,4,5))`;
+      if (countyVals && troopVals) {
+        computedWhere = `(UPPER(County) IN (${countyVals}) AND UPPER(Troop) IN (${troopVals}) AND CntyRankVeh IN (1,2,3,4,5))`;
+      } else if (countyVals) {
+        computedWhere = `(UPPER(County) IN (${countyVals}) AND CntyRankVeh IN (1,2,3,4,5))`;
+      } else if (troopVals) {
+        computedWhere = `(UPPER(Troop) IN (${troopVals}) AND CntyRankVeh IN (1,2,3,4,5))`;
       } else {
         computedWhere = `CntyRankVeh IN (1,2,3,4,5)`;
       }
     } else {
       computedWhere = this.buildLelWhere(selectedLelRegions);
-      // Accept both base and "NAME COUNTY" variants while in LEL mode
+      // Accept both base and "NAME COUNTY"/"NAME CO" while in LEL mode
       if (selectedCountyBases.size) {
-        const countyTokens = Array.from(selectedCountyBases)
-          .map(n => [`'${esc(n)}'`, `'${esc(n + " COUNTY")}'`])
-          .flat();
+        const countyTokens = Array.from(selectedCountyBases).flatMap(n => {
+          const up = esc(n.toUpperCase());
+          return [`'${up}'`, `'${up} COUNTY'`, `'${up} CO'`];
+        });
         const countyVals = Array.from(new Set(countyTokens)).join(",");
         computedWhere = `(${computedWhere}) AND UPPER(County) IN (${countyVals})`;
       }
     }
 
-    // one call only (new signature)
-    this.scheduleApply(desiredMode, computedWhere, lelKey, countyKey, troopKey);
+    // --- DIAGNOSTIC: verify the WHERE actually returns features on first render ---
+    const probeToken = this.updateToken; // reuse the same token you use elsewhere if you prefer
+    const pureLelOnly = desiredMode === "LEL" && selectedCountyBases.size === 0 && selectedTroops.size === 0;
+
+    try {
+      (this.hccsLayer as EsriFeatureLayer).query()
+        .where(computedWhere)
+        .count((err: any, n: number) => {
+          // If another update happened, ignore this result
+          if (probeToken !== this.updateToken) return;
+
+          console.log("[HCCS where probe]", {
+            desiredMode, computedWhere, count: err ? "ERR" : n, err
+          });
+
+          // Only swap in pure LEL-only scenario to avoid dropping county/troop filters
+          if (!err && n === 0 && pureLelOnly && this.lastLelAltWhere && computedWhere !== this.lastLelAltWhere) {
+            console.warn("[HCCS] LEL text WHERE returned 0; swapping to numeric WHERE");
+            const s = { desiredMode, where: this.lastLelAltWhere, lelKey, countyKey, troopKey };
+            this.lastSnapshot = s;
+            this.applyState(s, true);
+          }
+        });
+    } catch (e) {
+      console.warn("[HCCS where probe threw]", e);
+    }
+
+    // Save snapshot
+    this.lastSnapshot = { desiredMode, where: computedWhere, lelKey, countyKey, troopKey };
+
+    // Force on the first DV we see after a blank (tab switch), and also just force on any DV in Service.
+    // (Keeps behavior predictable across page switches and embed modes.)
+    const forceFirst = !this.hasAppliedInitialWhere;
+    const force = true; // <- keep it simple in Service
+
+    this.queuedState = { desiredMode, where: computedWhere, lelKey, countyKey, troopKey };
+    if (this.scheduledApply) return;
+    this.scheduledApply = true;
+    requestAnimationFrame(() => {
+      this.scheduledApply = false;
+      const s = this.queuedState!;
+      this.queuedState = undefined;
+      this.applyState(s, force);
+      if (forceFirst) this.hasAppliedInitialWhere = true;
+    });
 
     // tidy, accurate debug info
     console.log("[HCCS debug update]", {
@@ -433,9 +541,12 @@ export class Visual implements IVisual {
 
   }
 
+  // destroy()
   public destroy(): void {
     if (this.autoRefreshTimer) clearInterval(this.autoRefreshTimer);
     document.removeEventListener("visibilitychange", this.onVisibilityRefresh);
+    this.io?.disconnect();        // <-- add this
+    this.io = undefined;
     this.map.remove();
   }
 
@@ -461,11 +572,11 @@ export class Visual implements IVisual {
 
     this.darkMap = L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
       attribution: '&copy; <a href="https://carto.com/">CARTO</a>', subdomains: "abcd", maxZoom: 20
-    }).addTo(this.map);
+    });
 
     this.lightMap = L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
       maxZoom: 19, attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-    });
+    }).addTo(this.map);
   }
 
   private resizeMap(opts: VisualUpdateOptions) {
@@ -605,9 +716,6 @@ export class Visual implements IVisual {
     }, delayMs);
   }
 
-  // was: private scheduledApply = false;
-  //      private queuedState?: { desiredMode: "LEL" | "COUNTY"; where: string; lelKey: string };
-
   private scheduledApply = false;
   private queuedState?: {
     desiredMode: "LEL" | "COUNTY";
@@ -617,47 +725,61 @@ export class Visual implements IVisual {
     troopKey: string;
   };
 
-  private scheduleApply(desiredMode: "LEL" | "COUNTY", where: string, lelKey: string, countyKey: string, troopKey: string) {
-    this.queuedState = { desiredMode, where, lelKey, countyKey, troopKey };
-    if (this.scheduledApply) return;
-    this.scheduledApply = true;
-    requestAnimationFrame(() => {
-      this.scheduledApply = false;
-      const s = this.queuedState!;
-      this.queuedState = undefined;
-      this.applyState(s);
-    });
-  }
-
-  private applyState(s: { desiredMode: "LEL" | "COUNTY"; where: string; lelKey: string; countyKey: string; troopKey: string }) {
+  private applyState(
+    s: { desiredMode: "LEL" | "COUNTY"; where: string; lelKey: string; countyKey: string; troopKey: string },
+    force = false
+  ) {
     const layer = this.hccsLayer as any;
     if (!layer) return;
 
     const token = ++this.updateToken;
-    const modeChanged = (this.currentMode !== s.desiredMode);
+    const modeChanged  = (this.currentMode !== s.desiredMode);
     const whereChanged = (this.lastWhere !== s.where);
 
     this.currentMode = s.desiredMode;
 
-    if (whereChanged) {
-      this.lastWhere = s.where;
-      layer.setWhere(s.where);
-      layer.refresh?.();
+    // Always ensure the HCCs overlay is ON (don’t rely on the grouped control)
+    if (!this.map.hasLayer(layer)) {
+      try { this.map.addLayer(layer); } catch {}
     }
-    if (modeChanged) layer.setStyle(this.hccsStyle);
 
-    this.setBoundaryModeStable(this.currentMode);
-    this.debouncedFitToHccs(token);
+    const doFit = () => this.debouncedFitToHccs(token, 250); // small delay to let service settle
+
+    if (force) {
+      // HARD refresh to beat page virtualization/cache
+      try { layer.setWhere("1=0"); layer.refresh?.(); } catch {}
+      setTimeout(() => {
+        this.lastWhere = s.where;
+        try { layer.setWhere(s.where); layer.refresh?.(); } catch {}
+
+        // restyle + boundary toggle, then fit after a short nudge
+        setTimeout(() => {
+          try { layer.setStyle(this.hccsStyle); } catch {}
+          this.setBoundaryModeStable(this.currentMode);
+          doFit();
+        }, 60);
+      }, 0);
+    } else {
+      if (whereChanged) {
+        this.lastWhere = s.where;
+        try { layer.setWhere(s.where); layer.refresh?.(); } catch {}
+      }
+      if (modeChanged) {
+        try { layer.setStyle(this.hccsStyle); } catch {}
+      }
+      this.setBoundaryModeStable(this.currentMode);
+      doFit();
+    }
 
     // remember latest selections
-    this.lastLelKey = s.lelKey;
+    this.lastLelKey    = s.lelKey;
     this.lastCountyKey = s.countyKey;
-    this.lastTroopKey = s.troopKey;
+    this.lastTroopKey  = s.troopKey;
   }
 
-  // PATCH A — replace entire method
+  // Build WHERE for LEL mode and set an alternate WHERE in case the field is numeric
   private buildLelWhere(selectedLelRegions: Set<string>): string {
-    // LEL_Region is TEXT: e.g., "1","2","3"
+    // No LEL selection = statewide LEL top 5
     if (selectedLelRegions.size === 0) {
       this.lastLelAltWhere = null;
       return "LELRank IN (1,2,3,4,5)";
@@ -665,20 +787,35 @@ export class Visual implements IVisual {
 
     const esc = (s: string) => s.replace(/'/g, "''");
 
-    // pull out the region number if the slicer label contains words (e.g., "Region 3")
-    const vals = Array.from(selectedLelRegions)
+    // Pull out the digits from labels like "Region 3"
+    const raw = Array.from(selectedLelRegions)
       .map(s => (String(s).match(/\d+/)?.[0] ?? String(s)).trim())
-      .filter(s => s.length > 0)
-      .map(s => `'${esc(s)}'`);
+      .filter(s => s.length > 0);
 
-    const inList = Array.from(new Set(vals)).join(",");
-    this.lastLelAltWhere = null; // no alternate WHERE needed anymore
-    return `LEL_Region IN (${inList}) AND LELRank IN (1,2,3,4,5)`;
+    // Preferred (string) + fallback (numeric)
+    const inListStr = Array.from(new Set(raw.map(v => `'${esc(v)}'`))).join(",");
+    const inListNum = Array.from(new Set(raw.map(v => `${Number(v)}`))).join(",");
+
+    const textWhere = `LEL_Region IN (${inListStr}) AND LELRank IN (1,2,3,4,5)`;
+    const numWhere  = `LEL_Region IN (${inListNum}) AND LELRank IN (1,2,3,4,5)`;
+
+    // If the server rejects the first WHERE, requesterror will auto-retry with this.alt
+    this.lastLelAltWhere = numWhere;
+
+    return textWhere;
   }
 
   // helpers
   private onVisibilityRefresh = () => {
-    if (document.visibilityState === "visible") this.refreshAllLayers();
+    if (document.visibilityState !== "visible") return;
+    try { this.map.invalidateSize(); } catch {}
+
+    const snap = this.lastSnapshot;
+    const layer = this.hccsLayer as any;
+    if (!snap || !layer) return;
+
+    try { layer.setWhere("1=0"); layer.refresh?.(); } catch {}
+    setTimeout(() => this.applyState(snap, true), 60);
   };
 
   private startAutoRefresh(ms: number) {
