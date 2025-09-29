@@ -1,0 +1,29 @@
+# Playwright auth profile (contains cookies/tokens — very sensitive!)
+.pbi_auth/
+.pbi_auth_powerbi/
+
+# Playwright browser binaries
+ms-playwright/
+
+# Power BI export outputs
+powerbi_tab_exports/
+*.png
+*.pdf
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pdb
+*.pkl
+
+# Virtual environment
+.venv/
+env/
+venv/
+
+# OS files
+.DS_Store
+Thumbs.db
+
