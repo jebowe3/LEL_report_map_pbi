@@ -165,7 +165,7 @@ def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     with sync_playwright() as pw:
-        user_dir = str((Path.cwd() / ".pbi_auth").resolve())
+        user_dir = str((Path.home() / ".pbi_auth_powerbi").resolve())
 
         # Persistent context keeps you signed in between runs
         browser = pw.chromium.launch_persistent_context(
